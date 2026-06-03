@@ -5,23 +5,58 @@ import (
 	"time"
 )
 
+// Config 定义 batchdb 的运行参数。零值字段会在初始化时自动填充为合理的默认值。
 type Config struct {
-	Hooks                   *Hooks
-	BatchSize               int           // 默认 1000
-	MaxBufferSize           int           // 默认 100000
-	FlushInterval           time.Duration // 默认 200ms
-	Workers                 int           // 默认 8；经验法则：min(表数量, MaxOpenConns/2)
-	MaxRetries              int           // 默认 3
-	RetryBaseDelay          time.Duration // 默认 100ms
-	WALDir                  string        // 默认 "./wal"
-	WALMaxFileSize          int64         // 默认 64MB
-	WALMaxFileRows          int           // 默认 100000
-	MaxWALSize              int64         // 默认 5GB
-	WALCompress             bool          // 默认 true (gzip level 1)
-	WALProbeInterval        time.Duration // 默认 5s
-	ReplayBatchSize         int           // 默认 500
-	ReplayInterval          time.Duration // 默认 50ms
-	CircuitBreakerThreshold int           // 默认 3
+	// Hooks 生命周期回调钩子（可选）。
+	Hooks *Hooks
+
+	// BatchSize 触发异步刷写的缓冲区阈值。
+	// 当某张表的缓冲区记录数达到该值时，Worker 会被唤醒执行写入。
+	BatchSize int // 默认 1000
+
+	// MaxBufferSize 单表缓冲区的硬上限。
+	// 超过此值时 AddRecord 会同步将溢出数据写入 WAL，防止 OOM。
+	MaxBufferSize int // 默认 100000
+
+	// FlushInterval 定时器周期：即使缓冲区未满也会触发刷写，保证数据时效性。
+	FlushInterval time.Duration // 默认 200ms
+
+	// Workers 并发刷写 Worker 的数量。
+	// 推荐值：min(表数量, 数据库连接池大小/2)。
+	Workers int // 默认 8
+
+	// MaxRetries 单次批量写入的最大重试次数（不含首次尝试）。
+	MaxRetries int // 默认 3
+
+	// RetryBaseDelay 重试退避的基准延迟，实际延迟 = base * 2^(attempt-1)。
+	RetryBaseDelay time.Duration // 默认 100ms
+
+	// WALDir WAL 文件存储目录。每张表在该目录下有独立子目录。
+	WALDir string // 默认 "./wal"
+
+	// WALMaxFileSize 单个 WAL 文件的最大字节数，超过后自动轮转新文件。
+	WALMaxFileSize int64 // 默认 64MB
+
+	// WALMaxFileRows 单个 WAL 文件的最大行数，超过后自动轮转新文件。
+	WALMaxFileRows int // 默认 100000
+
+	// MaxWALSize WAL 目录的总容量上限。超过后 Write 返回 ErrWALFull。
+	MaxWALSize int64 // 默认 5GB
+
+	// WALCompress 是否启用 gzip 压缩（level=1，速度优先）。
+	WALCompress bool // 默认 true
+
+	// WALProbeInterval 后台重放循环探测数据库可用性的间隔。
+	WALProbeInterval time.Duration // 默认 5s
+
+	// ReplayBatchSize 重放时每批写入的记录数。
+	ReplayBatchSize int // 默认 500
+
+	// ReplayInterval 重放相邻批次之间的间隔，用于限速避免冲击数据库。
+	ReplayInterval time.Duration // 默认 50ms
+
+	// CircuitBreakerThreshold 触发熔断的连续失败次数。
+	CircuitBreakerThreshold int // 默认 3
 }
 
 func (c *Config) applyDefaults() {

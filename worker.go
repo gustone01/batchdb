@@ -8,18 +8,21 @@ import (
 	"time"
 )
 
+// workerPool 是信号驱动的并发刷写引擎。
+// 收到 tableName 信号后从 bufferManager 取出数据，分批写入数据库；
+// 写入失败经重试后降级到 WAL。
 type workerPool struct {
-	cfg        *Config
-	bufMgr     *bufferManager
-	writer     Writer
-	walMgr     *walManager
-	cb         *circuitBreaker
-	stats      *statsCollector
-	hooks      *Hooks
-	signalCh   chan string
-	wg         sync.WaitGroup
-	ctx        context.Context
-	cancel     context.CancelFunc
+	cfg      *Config          // 运行配置引用
+	bufMgr   *bufferManager   // 缓冲管理器，Worker 从中 drain 数据
+	writer   Writer           // 数据库写入器
+	walMgr   *walManager      // WAL 管理器，写入失败时降级使用
+	cb       *circuitBreaker  // 熔断器，Open 时直接跳过写入
+	stats    *statsCollector  // 统计指标收集器
+	hooks    *Hooks           // 生命周期回调钩子
+	signalCh chan string      // 携带 tableName 的刷写信号通道（带缓冲，容量=Workers*4）
+	wg       sync.WaitGroup   // 等待所有 Worker goroutine 退出
+	ctx      context.Context  // 生命周期上下文
+	cancel   context.CancelFunc
 }
 
 func newWorkerPool(
@@ -55,6 +58,7 @@ func (wp *workerPool) start() {
 	}
 }
 
+// submitFlush 发送一个非阻塞的刷写信号。信号通道满时丢弃（因为已有信号排队）。
 func (wp *workerPool) submitFlush(tableName string) {
 	select {
 	case wp.signalCh <- tableName:
@@ -62,6 +66,7 @@ func (wp *workerPool) submitFlush(tableName string) {
 	}
 }
 
+// stop 关闭信号通道并等待所有 Worker 处理完剩余信号后退出。
 func (wp *workerPool) stop() {
 	close(wp.signalCh)
 	wp.wg.Wait()
@@ -74,6 +79,8 @@ func (wp *workerPool) loop() {
 	}
 }
 
+// processTable 从缓冲区取出指定表的全部数据，按列结构分组后逐组写入。
+// 同一组内的记录具有相同的列列表，可以合并到一条 INSERT 语句中。
 func (wp *workerPool) processTable(tableName string) {
 	records := wp.bufMgr.drain(tableName)
 	if len(records) == 0 {
@@ -95,6 +102,8 @@ func (wp *workerPool) processTable(tableName string) {
 	}
 }
 
+// groupByColumns 将记录按列名组合分组。
+// 使用 \x00 作为列名分隔符生成 key，保证不同列结构的记录分开写入。
 func (wp *workerPool) groupByColumns(records []recordData) map[string][]recordData {
 	groups := make(map[string][]recordData)
 	for _, rec := range records {
@@ -104,6 +113,7 @@ func (wp *workerPool) groupByColumns(records []recordData) map[string][]recordDa
 	return groups
 }
 
+// writeWithRetry 执行带指数退避重试的写入。全部重试失败后降级到 WAL。
 func (wp *workerPool) writeWithRetry(tableName string, cols []string, rows [][]any) {
 	if wp.cb.State() == circuitOpen {
 		wp.fallbackToWAL(tableName, cols, rows)
@@ -151,6 +161,7 @@ func (wp *workerPool) writeWithRetry(tableName string, cols []string, rows [][]a
 	}
 }
 
+// fallbackToWAL 将写入失败的数据持久化到 WAL 文件，防止数据丢失。
 func (wp *workerPool) fallbackToWAL(tableName string, cols []string, rows [][]any) {
 	records := make([]recordData, len(rows))
 	for i, row := range rows {

@@ -17,34 +17,39 @@ import (
 	"time"
 )
 
+// walRecord 是 WAL 文件中单行 JSON 的序列化结构。
 type walRecord struct {
 	Columns []string `json:"columns"`
 	Values  []any    `json:"values"`
 }
 
+// walWriter 管理单个表的 WAL 文件写入，支持自动轮转和 gzip 压缩。
 type walWriter struct {
-	mu       sync.Mutex
-	dir      string
-	file     *os.File
-	gzWriter *gzip.Writer
-	bufW     *bufio.Writer
-	rows     int
-	size     int64
-	cfg      *Config
+	mu       sync.Mutex    // 保护文件写入的并发安全
+	dir      string        // 该表的 WAL 子目录路径
+	file     *os.File      // 当前打开的 WAL 文件句柄
+	gzWriter *gzip.Writer  // gzip 压缩写入器（WALCompress=true 时非 nil）
+	bufW     *bufio.Writer // 缓冲写入器，减少系统调用次数
+	rows     int           // 当前文件已写入的行数
+	size     int64         // 当前文件已写入的字节数
+	cfg      *Config       // 引用配置（用于判断轮转阈值）
 }
 
+// walManager 协调所有表的 WAL 写入和后台重放。
+// WAL 目录结构：<WALDir>/<tableName>/<timestamp>.wal
+// 损坏的记录会被移动到 <WALDir>/dead/<tableName>/ 目录。
 type walManager struct {
-	cfg           *Config
-	writers       sync.Map // tableName -> *walWriter
-	totalSize     atomic.Int64
-	replayStop    chan struct{}
-	replayDone    chan struct{}
-	probeStop     chan struct{}
-	probeDone     chan struct{}
-	writer        Writer
-	stats         *statsCollector
-	hooks         *Hooks
-	closed        atomic.Bool
+	cfg        *Config          // 运行配置引用
+	writers    sync.Map         // tableName -> *walWriter，每表一个写入器
+	totalSize  atomic.Int64     // WAL 目录总大小（字节），用于容量限制判断
+	replayStop chan struct{}    // 通知重放循环退出的信号
+	replayDone chan struct{}    // 重放循环退出后关闭，用于等待 goroutine 结束
+	probeStop  chan struct{}    // 探测循环退出信号（预留）
+	probeDone  chan struct{}    // 探测循环完成信号（预留）
+	writer     Writer           // 重放时使用的数据库写入器
+	stats      *statsCollector  // 统计指标收集器
+	hooks      *Hooks           // 生命周期回调钩子
+	closed     atomic.Bool      // 标记是否已关闭
 }
 
 func newWALManager(cfg *Config, writer Writer, stats *statsCollector, hooks *Hooks) *walManager {
@@ -74,6 +79,8 @@ func (wm *walManager) scanDiskUsage() int64 {
 	return total
 }
 
+// Write 将记录批量追加到对应表的 WAL 文件。
+// 当 WAL 总大小超过 MaxWALSize 时返回 ErrWALFull。
 func (wm *walManager) Write(tableName string, records []recordData) error {
 	if len(records) == 0 {
 		return nil
@@ -133,6 +140,7 @@ func (wm *walManager) getOrCreateWriter(tableName string) *walWriter {
 	return actual.(*walWriter)
 }
 
+// rotate 关闭当前 WAL 文件并创建新文件。文件名使用时间戳保证唯一性和顺序性。
 func (w *walWriter) rotate() error {
 	if err := w.closeFile(); err != nil {
 		return err
@@ -163,6 +171,8 @@ func (w *walWriter) rotate() error {
 	return nil
 }
 
+// flush 将缓冲数据刷入磁盘。对于 gzip 模式需要先关闭再重新打开 gzWriter，
+// 以确保压缩流完整可读（支持后续重放时从任意文件断点读取）。
 func (w *walWriter) flush() error {
 	if w.bufW != nil {
 		if err := w.bufW.Flush(); err != nil {
@@ -230,6 +240,8 @@ func (wm *walManager) FileCount() int {
 
 // --- Replay ---
 
+// startReplayLoop 启动后台 WAL 重放循环。
+// 首次立即尝试重放已有文件，之后按 WALProbeInterval 周期性探测 DB 可用性后重放。
 func (wm *walManager) startReplayLoop() {
 	go func() {
 		defer close(wm.replayDone)
@@ -330,6 +342,8 @@ func (wm *walManager) replayTable(tableName, tableDir string) {
 	}
 }
 
+// replayFile 读取并重放单个 WAL 文件中的所有记录。
+// 损坏的 JSON 行会被移动到 dead-letter 目录，不阻塞其他正常记录的重放。
 func (wm *walManager) replayFile(tableName, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -402,6 +416,7 @@ func (wm *walManager) replayFile(tableName, path string) error {
 	return nil
 }
 
+// replayBatch 将一批 WAL 记录重新写入数据库。写入前会先 Ping 探测数据库可用性。
 func (wm *walManager) replayBatch(tableName string, batch []walRecord) error {
 	if err := wm.writer.Ping(context.Background()); err != nil {
 		return fmt.Errorf("db unavailable during replay: %w", err)
@@ -430,6 +445,7 @@ func (wm *walManager) replayBatch(tableName string, batch []walRecord) error {
 	return nil
 }
 
+// moveToDeadLetter 将无法解析的 WAL 文件整体移动到 dead-letter 目录保留供人工排查。
 func (wm *walManager) moveToDeadLetter(tableName, srcPath string) {
 	deadDir := filepath.Join(wm.cfg.WALDir, "dead", tableName)
 	_ = os.MkdirAll(deadDir, 0755)
@@ -437,6 +453,7 @@ func (wm *walManager) moveToDeadLetter(tableName, srcPath string) {
 	_ = os.Rename(srcPath, destPath)
 }
 
+// writeDeadLetterLine 将单条损坏的 JSON 行追加到 dead-letter 文件，避免阻塞正常重放流程。
 func (wm *walManager) writeDeadLetterLine(tableName string, line []byte) {
 	deadDir := filepath.Join(wm.cfg.WALDir, "dead", tableName)
 	_ = os.MkdirAll(deadDir, 0755)
