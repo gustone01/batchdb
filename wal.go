@@ -52,7 +52,11 @@ type walManager struct {
 	closed     atomic.Bool      // 标记是否已关闭
 }
 
-func newWALManager(cfg *Config, writer Writer, stats *statsCollector, hooks *Hooks) *walManager {
+func newWALManager(cfg *Config, writer Writer, stats *statsCollector, hooks *Hooks) (*walManager, error) {
+	if err := os.MkdirAll(cfg.WALDir, 0755); err != nil {
+		return nil, fmt.Errorf("batchdb: create WAL directory %q: %w", cfg.WALDir, err)
+	}
+
 	wm := &walManager{
 		cfg:        cfg,
 		writer:     writer,
@@ -64,7 +68,7 @@ func newWALManager(cfg *Config, writer Writer, stats *statsCollector, hooks *Hoo
 		probeDone:  make(chan struct{}),
 	}
 	wm.totalSize.Store(wm.scanDiskUsage())
-	return wm
+	return wm, nil
 }
 
 func (wm *walManager) scanDiskUsage() int64 {

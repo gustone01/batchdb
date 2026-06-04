@@ -53,7 +53,11 @@ func New(writer Writer, cfg Config) (*DB, error) {
 	cb := &circuitBreaker{threshold: cfg.CircuitBreakerThreshold}
 
 	bufMgr := &bufferManager{batchSize: cfg.BatchSize}
-	walMgr := newWALManager(&cfg, writer, stats, cfg.Hooks)
+	walMgr, err := newWALManager(&cfg, writer, stats, cfg.Hooks)
+	if err != nil {
+		cancel()
+		return nil, err
+	}
 
 	wp := newWorkerPool(ctx, cancel, &cfg, bufMgr, writer, walMgr, cb, stats, cfg.Hooks)
 	wp.start()
